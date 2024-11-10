@@ -1,0 +1,93 @@
+Q1 FY2024 Earnings Conference Call
+July 27, 2023
+ANALYST: MR. RONAK MEHTA – JM FINANCIAL
+MANAGEMENT: MR. K.A. JOSEPH – MANAGING DIRECTOR & CO-FOUNDER
+MR. SANJAY THAPAR – CEO & EXECUTIVE DIRECTOR
+MR. MAHENDRA NAREDI – CHIEF FINANCIAL OFFICER
+MS. DEVANSHI DHRUVA – HEAD – INVESTOR RELATIONS
+
+
+Python Code:
+
+import fitz  # PyMuPDF for PDF processing
+import openai  # For GPT summarization
+import re
+
+# Set up OpenAI API (replace with your API key)
+openai.api_key = "your-api-key-here"
+
+# Extract text from PDF
+def extract_text_from_pdf(pdf_path):
+    doc = fitz.open(pdf_path)
+    text = ""
+    for page in doc:
+        text += page.get_text("text")
+    doc.close()
+    return text
+
+# Process the text to separate speakers and their statements
+def parse_speakers(text):
+    # Use regex to split by speakers
+    speaker_pattern = r"\b(ANALYST|MANAGEMENT):\s+(MR|MS)\.\s+[A-Z\s]+"
+    sections = re.split(speaker_pattern, text)
+    
+    # Extract statements by each speaker
+    parsed_text = []
+    current_speaker = None
+    
+    for part in sections:
+        if re.match(r"(ANALYST|MANAGEMENT)", part.strip()):
+            current_speaker = part.strip()  # Update speaker
+        else:
+            parsed_text.append({"speaker": current_speaker, "text": part.strip()})
+    
+    return parsed_text
+
+# Generate insights for investors using GPT
+def generate_insights(parsed_text):
+    # Create a structured summary focusing on key points for investors
+    insights = []
+    for section in parsed_text:
+        if section["speaker"] == "ANALYST":
+            prompt = (
+                "Summarize the following analyst question or comment related to company performance, "
+                "focusing on growth, earnings impact, and future outlook:\n\n" + section["text"]
+            )
+        elif section["speaker"] == "MANAGEMENT":
+            prompt = (
+                "Summarize the following management response, focusing on key changes in the business, "
+                "triggers for growth, and any factors that could impact earnings:\n\n" + section["text"]
+            )
+        else:
+            continue  # Skip unassigned parts
+
+        # API call to GPT to get the summary
+        response = openai.Completion.create(
+            model="text-davinci-003",
+            prompt=prompt,
+            max_tokens=500,
+            temperature=0.5
+        )
+        insights.append(response.choices[0].text.strip())
+    
+    return insights
+
+# Main function
+def main(pdf_path):
+    # Extract text from the PDF
+    raw_text = extract_text_from_pdf(pdf_path)
+    
+    # Parse speakers and text segments
+    parsed_text = parse_speakers(raw_text)
+    
+    # Generate and print investor insights
+    key_insights = generate_insights(parsed_text)
+    print("Investor Insights Summary:\n")
+    for insight in key_insights:
+        print(insight + "\n")
+
+# Specify the path to the PDF document
+pdf_path = "path_to_your_pdf_file.pdf"
+main(pdf_path)
+
+

@@ -180,7 +180,7 @@ Step 5: Deployment
 - Backend: Deploy the Node.js backend on platforms like Heroku, AWS EC2, or DigitalOcean.
 - Database:Use PostgreSQL on platforms like Heroku Postgres, AWS RDS, or DigitalOcean Managed Databases.
 
-Step 6: Provide GitHub Repository and Demo Link**
+Step 6: Provide GitHub Repository and Demo Link
 
 1. GitHub Repository:
    - Create a public GitHub repository containing your code (backend and frontend).

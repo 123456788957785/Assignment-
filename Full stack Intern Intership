@@ -1,0 +1,130 @@
+Part A – System Design
+
+1. System Architecture
+
+Architecture: Client–Server using RESTful APIs
+Tech Stack:
+
+Backend: Python (FastAPI recommended for speed & docs)
+
+Frontend: React (or basic HTML/JS/CSS)
+
+Database: PostgreSQL or SQLite
+
+Auth: JWT-based authentication with roles
+
+Deployment: Docker + Gunicorn/Uvicorn (for scaling)
+
+
+Frontend (React/UI) → API Gateway (FastAPI) → Database (PostgreSQL/SQLite)
+                               ↑
+                       JWT Authentication
+
+2. Core Entities & Relationships
+
+Entity	Attributes	Relationships
+
+User	id, name, email, password_hash, role (student/teacher)	One-to-many (teacher → assignments)
+Assignment	id, title, description, due_date, teacher_id	One-to-many (assignment → submissions)
+Submission	id, assignment_id, student_id, content, timestamp	Many-to-one
+
+3. API Endpoints
+
+1. Teacher creates assignment
+
+POST /assignments/
+Headers: Authorization: Bearer <JWT>
+Body: {
+  "title": "Math Homework",
+  "description": "Solve Q1-Q10",
+  "due_date": "2025-08-01"
+}
+
+2. Student submits assignment
+
+POST /assignments/{assignment_id}/submit/
+Headers: Authorization: Bearer <JWT>
+Body: {
+  "content": "My answer is attached",
+  "file_url": "optional_file_url.pdf"
+}
+
+3. Teacher views submissions
+
+GET /assignments/{assignment_id}/submissions/
+Headers: Authorization: Bearer <JWT>
+
+4. Authentication Strategy
+
+JWT Auth with role-based access
+
+Roles: student, teacher
+
+Only teachers can create/view submissions.
+
+Students can only submit.
+
+5. Scalability Suggestions
+
+Switch from SQLite → PostgreSQL → cloud DB (e.g., Amazon RDS)
+
+Add Redis cache for frequently accessed assignments
+
+Use S3 for file uploads
+
+Deploy via Docker, Kubernetes for auto-scaling
+
+Use message queues (e.g., RabbitMQ) for file processing
+
+Part B – Prototype Implementation
+
+Tech Stack
+
+Backend: FastAPI
+
+DB: SQLite (easy for testing)
+
+
+Frontend: Basic HTML + JS (or React)
+
+1. API Code (FastAPI + SQLAlchemy)
+
+# main.py
+from fastapi import FastAPI, Depends, HTTPException
+from fastapi.security import OAuth2PasswordRequestForm, OAuth2PasswordBearer
+from pydantic import BaseModel
+from typing import List
+import jwt
+
+app = FastAPI()
+
+# === Pseudo-code and simplified logic for demonstration ===
+
+@app.post("/signup/")
+def signup(user: UserCreate): ...
+
+@app.post("/login/")
+def login(form_data: OAuth2PasswordRequestForm = Depends()): ...
+
+@app.post("/assignments/")
+def create_assignment(...): ...
+
+@app.post("/assignments/{id}/submit/")
+def submit_assignment(...): ...
+
+@app.get("/assignments/{id}/submissions/")
+def view_submissions(...): ...
+
+2. Frontend (Basic HTML/JS or React)
+
+Teacher UI:
+
+Form to create assignment
+
+View list of submissions per assignment
+
+
+Student UI:
+
+Form to submit assignment content
+

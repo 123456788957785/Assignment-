@@ -26,6 +26,7 @@ Frontend
 Minimal React (Vite or Next.js) to display list, filter, search (calls 
 backend search endpoints). Show category label and suggested 
 reply when available.
+
 1 — Docker Compose (Elasticsearch + Kibana + Weaviate)
 docker-compose.yml (example):
 version: "3.8"

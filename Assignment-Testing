@@ -1,0 +1,538 @@
+Architecture
+Backend (Node.js + TypeScript)
+IMAP sync service using imapflow (supports IDLE/persistent 
+connections).
+Email processing pipeline: fetch message metadata & body → 
+store raw + index in Elasticsearch → call AI categorizer → on 
+Interested send Slack + webhook.
+REST API to query emails (search/filter) for Postman / frontend.
+RAG service: vector DB (Weaviate or Milvus), embeddings + 
+retrieval + LLM to generate suggested replies.
+Search / Storage
+Elasticsearch (docker) for full-text searchable email storage + 
+filtering by folder/account.
+Vector DB (Weaviate via Docker) for storing product/outreach 
+
+
+AI
+Use an LLM for classification & suggested replies (OpenAI, or 
+any hosted LLM).
+Use embedding model for vectors (OpenAI embeddings or 
+other).
+Integrations
+Slack Incoming Webhooks for notifications.
+Webhook.site as external webhook (for testing).
+Frontend
+Minimal React (Vite or Next.js) to display list, filter, search (calls 
+backend search endpoints). Show category label and suggested 
+reply when available.
+1 — Docker Compose (Elasticsearch + Kibana + Weaviate)
+docker-compose.yml (example):
+version: "3.8"
+services:
+elasticsearch:
+ image: docker.elastic.co/elasticsearch/elasticsearch:8.8.1
+ container_name: es
+ environment:
+ - discovery.type=single-node
+ - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+ - xpack.security.enabled=false
+ ulimits:
+ memlock:
+ soft: -1
+ hard: -1
+ ports:
+ - "9200:9200"
+ volumes:
+ - esdata:/usr/share/elasticsearch/data
+ kibana:
+ image: docker.elastic.co/kibana/kibana:8.8.1
+environment
+ - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+ ports:
+ - "5601:5601"
+ depends_on:
+ - elasticsearch
+ weaviate:
+ image: semitechnologies/weaviate:1.21.0
+ ports:
+ - "8080:8080"
+ environment:
+ - QUERY_DEFAULTS_LIMIT=20
+ - AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED=true
+ - PERSISTENCE_DATA_PATH=/var/lib/weaviate
+ - DEFAULT_VECTORIZER_MODULE=none # we'll push 
+vectors ourselves (OpenAI embeddings)
+ volumes:
+ - weavdata:/var/lib/weaviate
+volumes:
+esdata:
+ weavdata:
+
+2 — Elasticsearch index / mapping for emails
+Create an index emails with fields to support search and filters.
+Example index creation (curl or via Node):
+PUT /emails
+{
+ "mappings": {
+ "properties": {
+ "messageId": {"type":"keyword"},
+ "account": {"type":"keyword"},
+ "folder": {"type":"keyword"},
+ "from": {"type":"text"},
+ "to": {"type":"text"},
+ "subject": {"type":"text"},
+ "body": {"type":"text"},
+ "date": {"type":"date"},
+ "labels": {"type":"keyword"},
+ "category": {"type":"keyword"},
+ "raw": {"type":"object"},
+ "embedding": {"type":"dense_vector", "dims":1536}
+ }
+ }
+}
+You can create this programmatically with the 
+@elastic/elasticsearch client.
+
+3 — Key backend packages (Node + TS)
+Install:
+npm i imapflow @elastic/elasticsearch axios express bodyparser cors dotenv openai @slack/webhook weaviate-ts-client
+npm i -D typescript ts-node nodemon @types/express
+
+4 — IMAP realtime synchronizer (TypeScript)
+src/imapSync.ts — simplified service for multiple accounts, IDLE, 
+fetch last 30 days, index into Elasticsearch, categorize:
+// src/imapSync.ts
+import { ImapFlow } from "imapflow";
+import { Client as ESClient } from "@elastic/elasticsearch";
+import { categorizeEmail } from "./ai";
+import { notifyInterested } from "./notify";
+const es = new ESClient({ node: process.env.ES_NODE || 
+"http://localhost:9200" });
+type ImapAccount = {
+ id: string; // account id label
+ host: string;
+ port: number;
+ secure: boolean;
+ auth: { user: string; pass: string }
+};
+export async function startImapForAccount(account: 
+ImapAccount) {
+ const client = new ImapFlow({
+ host: account.host,
+ port: account.port,
+ secure: account.secure,
+ auth: account.auth,
+ logger: false
+ });
+ client.on("error", (err) => console.error("IMAP error:", err));
+ await client.connect();
+ console.log(`Connected to IMAP for account ${account.id}`);
+ // List mailboxes
+ for await (let mailbox of client.list()) {
+ // open mailbox in read-only mode
+ // We'll open INBOX and any interested folders later ondemand
+ }
+// Fetch recent 30 days emails when starting
+ const sinceDate = new Date();
+ sinceDate.setDate(sinceDate.getDate() - 30);
+ // Example: open INBOX
+ await client.mailboxOpen("INBOX");
+ // Search for messages since sinceDate
+ const searchCriteria = ["SINCE", 
+sinceDate.toISOString().split("T")[0]];
+ const uids = await client.search(searchCriteria);
+ console.log(`Found ${uids.length} messages in ${account.id} 
+INBOX`);
+ for (const seq of uids.slice(-1000)) { // limit
+ const msg = await client.fetchOne(seq, { source: true, 
+envelope: true, flags: true, internalDate: true });
+ await processAndIndexMessage(msg, account.id, "INBOX");
+ }
+ // Use IDLE (imapflow will emit 'exists' events)
+ client.on("exists", async () => {
+
+// New message arrived; we need to fetch the newest 
+messages (UIDLAST or search unseen)
+ const unseen = await client.search(["UNSEEN"]);
+ for (const uid of unseen) {
+ const msg = await client.fetchOne(uid, { source: true, 
+envelope: true, flags: true, internalDate: true });
+ await processAndIndexMessage(msg, account.id, "INBOX");
+ }
+ });
+}
+async function processAndIndexMessage(msg: any, accountId: 
+string, folder: string) {
+ try {
+ const messageId = msg.envelope.messageId || `mid-
+${Date.now()}`;
+ const subject = msg.envelope.subject || "";
+ const from = (msg.envelope.from || []).map((f:any) => 
+f.address).join(",");
+ const to = (msg.envelope.to || []).map((t:any) => 
+t.address).join(",");
+const date = msg.internalDate || new Date();
+ // Extract plain text body: imapflow source often contains full 
+raw; for brevity assume plain text extraction function
+ const body = extractPlainText(msg.source) || "";
+ // Index raw email
+ const doc = {
+ messageId,
+ account: accountId,
+ folder,
+ from,
+ to,
+ subject,
+ body,
+ date,
+ labels: [],
+ raw: { envelope: msg.envelope },
+ };
+ // AI categorization
+
+const category = await categorizeEmail({subject, body, from, 
+to});
+ doc['category'] = category;
+ await es.index({ index: "emails", id: messageId, document: 
+doc });
+ if (category === "Interested") {
+ await notifyInterested(doc);
+ }
+ console.log(`Indexed ${messageId} (${category})`);
+ } catch (err) {
+ console.error("processAndIndexMessage error:", err);
+ }
+}
+// Placeholder: implement reliable extraction from raw source
+function extractPlainText(rawSource: Buffer | string): string {
+ // Use mailparser in real implementation:
+ // const parsed = await simpleParser(rawSource)
+ // return parsed.text || parsed.html || "";
+ return rawSource.toString().slice(0, 1000);
+}
+Notes:
+In production use mailparser (npm i mailparser) to parse MIME 
+and get text and attachments.
+Use proper UID/messageId dedup to avoid re-indexing
+
+5 — AI Categorization (example using OpenAI chat completions)
+src/ai.ts
+// src/ai.ts
+import axios from "axios";
+import dotenv from "dotenv";
+dotenv.config();
+const OPENAI_KEY = process.env.OPENAI_API_KEY!;
+// Keep prompts concise & deterministic. Could also fine-tune 
+or build a small classifier on top of embeddings.
+export async function categorizeEmail({subject, body, from, to}: 
+{subject:string, body:string, from:string, to:string}) {
+ const system = `You are an email classifier. Choose one label 
+exactly from: Interested, Meeting Booked, Not Interested, 
+
+Spam, Out of Office. Base on subject & body. Provide only the 
+label.`;
+ const user = `Subject: ${subject}\n\nBody: ${body.slice(0, 
+3000)}`;
+ const resp = await 
+axios.post("https://api.openai.com/v1/chat/completions", {
+ model: "gpt-4o-mini", // or gpt-4o or gpt-4 or as available
+ messages: [
+ {role: "system", content: system},
+ {role: "user", content: user}
+ ],
+ max_tokens: 16,
+ temperature: 0
+ }, {
+ headers: { Authorization: `Bearer ${OPENAI_KEY}` }
+ });
+ const label = resp.data.choices?.[0]?.message?.content?.trim();
+ const normalized = normalizeLabel(label);
+ return normalized;
+}
+function normalizeLabel(out: string | undefined) {
+ if (!out) return "Not Interested";
+ const o = out.toLowerCase();
+ if (o.includes("interested")) return "Interested";
+ if (o.includes("meeting")) return "Meeting Booked";
+ if (o.includes("spam")) return "Spam";
+ if (o.includes("out of office") || o.includes("out-of-office") || 
+o.includes("ooo")) return "Out of Office";
+ return "Not Interested";
+}
+If you cannot use OpenAI, replace with a local model or a 
+simple rules-based classifier as fallback.
+
+6 — Slack & Webhook.site integration
+src/notify.ts
+import { IncomingWebhook } from "@slack/webhook";
+import axios from "axios";
+
+const slackUrl = process.env.SLACK_WEBHOOK_URL; // set this 
+in env
+const webhookTarget = 
+process.env.INTERESTED_WEBHOOK_URL || 
+"https://webhook.site/your-unique-url";
+export async function notifyInterested(emailDoc: any) {
+ try {
+ if (slackUrl) {
+ const webhook = new IncomingWebhook(slackUrl);
+ await webhook.send({
+ text: `*New Interested Email*\nFrom: 
+${emailDoc.from}\nSubject: ${emailDoc.subject}\nAccount: 
+${emailDoc.account}`,
+ blocks: [
+ { type: "section", text: { type: "mrkdwn", text: `*New 
+Interested Email* \n*From:* ${emailDoc.from}\n*Subject:* 
+${emailDoc.subject}\n*Account:* ${emailDoc.account}` } }
+ ]
+ });
+ }
+
+// Trigger external webhook (webhook.site)
+ await axios.post(webhookTarget, { event: "interested_email", 
+email: emailDoc });
+ } catch (err) {
+ console.error("notifyInterested error:", err);
+ }
+}
+For Slack, create an Incoming Webhook in your Slack workspace 
+and set SLACK_WEBHOOK_URL.
+For webhook.site, paste your unique URL into 
+INTERESTED_WEBHOOK_URL (good for demo).
+
+7 — REST API for Postman / Frontend
+Use Express to expose endpoints:
+src/server.ts
+import express from "express";
+import bodyParser from "body-parser";
+import cors from "cors";
+import { Client as ESClient } from "@elastic/elasticsearch";
+import dotenv from "dotenv";
+dotenv.config();
+const es = new ESClient({ node: process.env.ES_NODE || 
+"http://localhost:9200" });
+const app = express();
+app.use(cors());
+app.use(bodyParser.json());
+app.get("/health", (req, res) => res.json({ ok: true }));
+// Search emails (Elasticsearch)
+app.post("/search", async (req, res) => {
+ const { q, account, folder, category, from, size = 20, page = 0 } 
+= req.body;
+ const must:any[] = [];
+ if (q) {
+ must.push({
+ multi_match: { query: q, fields: 
+["subject^3","body","from","to"] }
+ });
+ }
+ if (account) must.push({ term: { account } });
+ if (folder) must.push({ term: { folder } });
+ if (category) must.push({ term: { category } });
+ if (from) must.push({ match: { from } });
+ const body:any = { query: { bool: { must: 
+must.length?must:[{ match_all: {} }] } }, sort: [{ date: { order: 
+"desc" }}], from: page*size, size };
+ const resp = await es.search({ index: "emails", body });
+ const hits = resp.hits.hits.map(h => ({ id: h._id, ...h._source }));
+ res.json({ total: resp.hits.total, hits });
+});
+// Get email by id
+app.get("/emails/:id", async (req, res) => {
+ const { id } = req.params;
+ const resp = await es.get({ index: "emails", id });
+ res.json(resp._source);
+});
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log("Server running on", PORT));
+Postman endpoints to demo:
+GET /health → returns { ok: true }.
+POST /search body: { "q": "pricing", "account": "acct1", 
+"folder":"INBOX", "size":10 } → returns hits.
+GET /emails/:id → returns full stored email.
+Show these in Postman with environment variables: ES_NODE, 
+API_BASE.
+
+8 — Frontend (Minimal React) — show emails + search + filters
+A minimal React component (use Vite or Next.js):
+src/frontend/src/App.jsx (simplified):
+import React, {useState, useEffect} from "react";
+import axios from "axios";
+function App() {
+ const [q, setQ] = useState("");
+ const [hits, setHits] = useState([]);
+ const [account, setAccount] = useState("");
+ const [folder, setFolder] = useState("");
+
+async function search() {
+ const resp = await axios.post("http://localhost:3000/search", 
+{ q, account, folder, size: 25 });
+ setHits(resp.data.hits || []);
+ }
+ useEffect(()=> { search(); }, []);
+ return (
+ <div style={{padding:20}}>
+ <h1>Onebox - Emails</h1>
+ <div style={{display:"flex", gap:8, marginBottom:12}}>
+ <input placeholder="Search..." value={q} 
+onChange={e=>setQ(e.target.value)} />
+ <input placeholder="Account" value={account} 
+onChange={e=>setAccount(e.target.value)} />
+ <input placeholder="Folder" value={folder} 
+onChange={e=>setFolder(e.target.value)} />
+ <button onClick={search}>Search</button>
+
+</div>
+ <div>
+ {hits.map(h => (
+ <div key={h.messageId} style={{border:"1px solid #ddd", 
+padding:10, marginBottom:8}}>
+ <div><strong>{h.subject}</strong> —
+<small>{h.from}</small></div>
+ <div style={{fontSize:13, 
+marginTop:6}}>{h.body?.slice(0,300)}...</div>
+ <div style={{marginTop:8}}>Category: <b>{h.category || 
+"N/A"}</b></div>
+ </div>
+ ))}
+ </div>
+ </div>
+ );
+}
+export default App;
+This UI demonstrates filtering by account/folder and shows 
+categories
+
+9 — RAG & Suggested Replies (vector DB + LLM)
+Workflow:
+1. Store product/outreach agenda docs in Weaviate (or Milvus). 
+Each item has text + metadata + embedding vector.
+2. For any Interested email, compute embedding of email body, 
+query the vector DB for top-k related product/agenda docs.
+3. Build prompt: include retrieved docs + email content + 
+instruction to suggest 2 short replies (tone: polite, reply options: 
+short and long, include CTA).
+4. Call LLM with the prompt; save suggested replies to 
+Elasticsearch under suggestedReplies.
+Example pseudocode for RAG:
+import weaviate from "weaviate-ts-client";
+import axios from "axios";
+const client = weaviate.client({ scheme: "http", host: 
+"localhost:8080" });
+async function suggestReplies(emailDoc) {
+
+// 1. get embedding for email
+ const embedding = await getEmbedding(emailDoc.body);
+ // 2. query weaviate
+ const res = await 
+client.graphql.get().withClassName("Agenda").withNearVector(
+{ vector: embedding, certainty: 0.65 }).withLimit(3).do();
+ const contexts = res.data.Get.Agenda.map(a => 
+a.text).join("\n---\n");
+ // 3. call LLM
+ const prompt = `You are a helpful sales assistant. Use these 
+context 
+docs:\n${contexts}\n\nEmail:\n${emailDoc.body}\n\nGenerate 
+2 suggested replies: one short (<=40 words) one full reply (>=60 
+words) with a clear CTA.`;
+ const llmResp = await callLLM(prompt);
+ // store returned suggestions in ES under email id
+ await es.update({ index: "emails", id: emailDoc.messageId, doc: 
+{ suggestedReplies: llmResp }});
+}
+
+Store product/agendas: create a Weaviate class Agenda with 
+text property and push embeddings using weaviate client, or 
+use the Weaviate REST API.
+
+Store product/agendas: create a Weaviate class Agenda with 
+text property and push embeddings using weaviate client, or 
+use the Weaviate REST API.
+
+11 — Grading checklist mapping to the assignment points
+Real-time IMAP Sync (1).
+Use imapflow with persistent connection, no cron. Fetch last 30 
+days on first sync. Support at least two accounts by starting 
+startImapForAccount for both.
+Searchable Storage (2)
+Dockerized Elasticsearch; mapping above; index email text; 
+filterable by folder and account.
+AI Categorization (3)
+categorizeEmail function using LLM; store category field on 
+each email.
+Slack & Webhook (4)
+notifyInterested sends Slack + webhook.site POST when 
+category === Interested.
+Frontend (5)
+Minimal React UI to show results, filters, categories. Search 
+powered by ES endpoint.
+RAG + Vector DB (6)
+Weaviate Docker; store agenda/product vectors; retrieval to 
+produce suggested replies with LLM; store suggestions on the 
+email object. This unlocks the interview invite.
+
+12 — Environment variables
+
+PORT=3000
+ES_NODE=http://localhost:9200
+OPENAI_API_KEY=sk-...
+SLACK_WEBHOOK_URL=https://hooks.slack.com/services/XXX
+INTERESTED_WEBHOOK_URL=https://webhook.site/your-uuid
+
+
+13 — Running locally (README steps)
+1. git clone <your-repo>
+2. docker compose up -d (runs Elasticsearch, Kibana, Weaviate)
+3. npm install
+4. create .env with keys above
+5. Run backend: npm run dev (use ts-node/nodemon)
+6. Start IMAP sync: ensure credentials for two test IMAP 
+accounts (Gmail note: if using Gmail enable IMAP & app 
+password / OAuth2)
+7. Open Postman; run the endpoints listed.
+8. Start frontend: cd frontend && npm install && npm run dev
+
+14 — Implementation tips & gotchas
+Gmail & OAuth2 — Gmail blocks plain username/password for 
+many accounts; use XOAUTH2 or an app password for demo. 
+For assignment use test IMAP accounts from any provider that 
+allows username+password IMAP auth.
+IMAP duplicate detection — dedupe by messageId (RFC 
+Message-ID) or UID+mailbox to avoid reindexing.
+Attachments — store attachments metadata in ES raw field or 
+blob store (S3).
+Rate limits & cost — if using OpenAI for every email, costs can 
+grow; batch classification or use a lighter model / rule-based 
+heuristics for low budget.
+Security — secure credentials (do not commit .env), use TLS 
+between services if exposing externally.
+Elasticsearch memory — allocate enough memory; use 
+ES_JAVA_OPTS e.g. -Xmx1g on dev machines with enough RAM.
+
+15 — Example repo structure
+/backend
+ /src
+
+imapSync.ts
+ ai.ts
+ notify.ts
+ server.ts
+ rag.ts
+ package.json
+/frontend
+ src/App.jsx
+docker-compose.yml
+README.md
+
+16 — Minimal tests to show in Postman
+1. Search (POST http://localhost:3000/search)
+{
+ "q": "pricing",
+ "account": "acct1",
+ "folder": "INBOX",
+
+"size": 10
+}
+2. Get email (GET http://localhost:3000/emails/<messageId>)
+3. Health (GET http://localhost:3000/health)
